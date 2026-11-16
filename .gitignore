@@ -1,0 +1,11 @@
+# secrets
+.env
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# local run state / caches / review sheets (logs/ IS committed: the brief asks for it)
+state/
+.llm_cache/
+review/
