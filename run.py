@@ -8,6 +8,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -60,7 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("config", help="show loaded configuration (secrets masked)")
     sub.add_parser("status", help="show how many tickets are open and handled (read-only)")
-    # Later phases: examples, reset, run
+    sub.add_parser("examples", help="save the 10 labelled examples to eval_results/examples.json (read-only)")
+    # Later phases: tickets, reset, run
     return p
 
 
@@ -69,12 +71,25 @@ async def cmd_status(cfg: Config) -> None:
         print(json.dumps(await hd.get_status(), indent=2))
 
 
+async def cmd_examples(cfg: Config) -> None:
+    async with HelpdeskClient(cfg.helpdesk_url, cfg.helpdesk_key, cfg.candidate_email) as hd:
+        examples = (await hd.get_examples())["examples"]
+    path = Path("eval_results/examples.json")
+    path.write_text(json.dumps(examples, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Saved {len(examples)} examples to {path}")
+    for ex in examples:
+        lab = ex["label"]
+        print(f"  {ex['id']}  {lab['language']}  {lab['category']:<16} {lab['priority']}  {lab['action']}")
+
+
 def main() -> None:
     args = build_parser().parse_args()
     if args.command == "config":
         print(load_config())
     elif args.command == "status":
         asyncio.run(cmd_status(load_config()))
+    elif args.command == "examples":
+        asyncio.run(cmd_examples(load_config()))
 
 
 if __name__ == "__main__":

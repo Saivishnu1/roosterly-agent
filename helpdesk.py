@@ -23,3 +23,8 @@ class HelpdeskClient:
     async def get_status(self) -> dict:
         resp = await self._http.get("/status")
         return resp.json()
+
+    async def get_examples(self) -> dict:
+        """The 10 tickets Nordavo labelled, used for the eval."""
+        resp = await self._http.get("/examples")
+        return resp.json()
