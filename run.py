@@ -64,7 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("examples", help="save the 10 labelled examples to eval_results/examples.json (read-only)")
     t = sub.add_parser("tickets", help="list one page of open tickets (read-only)")
     t.add_argument("--cursor", help="next_cursor printed by the previous page")
-    # Later phases: reset, run
+    sub.add_parser("reset", help="re-open all 30 practice tickets (CHANGES helpdesk state)")
+    # Later phases: run
     return p
 
 
@@ -79,6 +80,11 @@ async def cmd_tickets(cfg: Config, cursor: str | None) -> None:
     for t in page["tickets"]:
         print(f"{t['id']}  {t['customer_plan']:<6} {t['subject']}")
     print(f"next_cursor: {page['next_cursor']}")
+
+
+async def cmd_reset(cfg: Config) -> None:
+    async with HelpdeskClient(cfg.helpdesk_url, cfg.helpdesk_key, cfg.candidate_email) as hd:
+        print(json.dumps(await hd.reset(), indent=2))
 
 
 async def cmd_examples(cfg: Config) -> None:
@@ -102,6 +108,8 @@ def main() -> None:
         asyncio.run(cmd_tickets(load_config(), args.cursor))
     elif args.command == "examples":
         asyncio.run(cmd_examples(load_config()))
+    elif args.command == "reset":
+        asyncio.run(cmd_reset(load_config()))
 
 
 if __name__ == "__main__":

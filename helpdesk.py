@@ -52,3 +52,15 @@ class HelpdeskClient:
         """One ticket, plus how it was handled (if it was)."""
         resp = await self._http.get(f"/tickets/{ticket_id}")
         return resp.json()
+
+    async def post_decision(self, ticket_id: str, action: str, decision: dict) -> dict:
+        """Send the one decision for a ticket. `action` is reply, handoff or close."""
+        if action not in ("reply", "handoff", "close"):
+            raise ValueError(f"unknown action: {action}")
+        resp = await self._http.post(f"/tickets/{ticket_id}/{action}", json=decision)
+        return resp.json()
+
+    async def reset(self) -> dict:
+        """Re-open all practice tickets. Changes the helpdesk state."""
+        resp = await self._http.post("/practice/reset")
+        return resp.json()
