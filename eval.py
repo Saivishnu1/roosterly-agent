@@ -6,13 +6,17 @@
 - Each of the 10 examples runs 3 times by default: the model's answers vary between runs, and with only 10
   examples a single run would make a before/after difference of 1-2 look like a change when it is chance.
 
-    uv run python eval.py --tag baseline
+    uv run python eval.py --tag after_fix
     uv run python eval.py --tag quick --runs 1
+
+Every run is stored in eval_results/runs/ (git-ignored): one report per run, and one line per run in
+history.jsonl with the scores and the git commit it ran on. Only eval_results/baseline.md is committed.
 """
 import argparse
 import asyncio
 import json
 import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,6 +24,7 @@ from llm import Analyzer, ClaudeClient, LLMError
 from run import decide, load_config, load_faq, setup_logging
 
 EXAMPLES = Path("eval_results/examples.json")
+RUNS_DIR = Path("eval_results/runs")
 CONCURRENCY = 4
 FIELDS = ("action", "category", "priority", "language")
 PRICE_IN, PRICE_OUT = 0.10, 0.50  # USD per 1M tokens for claude-haiku-5-5
@@ -35,6 +40,17 @@ async def run_once(example: dict, analyzer: Analyzer, faq_ids: set[str], limit: 
     return {"action": d.action, "category": d.category, "priority": d.priority, "language": d.language,
             "checks": d.failed_checks, "draft": d.draft_reply,
             "english": verdict.english_translation if verdict else ""}
+
+
+def git_commit() -> str:
+    """The commit the eval ran on, with '+changes' if there were uncommitted edits (so a result is traceable)."""
+    try:
+        sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True).stdout.strip()
+    except OSError:
+        return "unknown"
+    return f"{sha}+changes" if dirty else sha or "unknown"
 
 
 def priority_distance(a: str, b: str) -> int:
@@ -64,13 +80,14 @@ def score(examples: list[dict], results: dict[str, list[dict]]) -> dict[str, int
     return s
 
 
-def report(tag: str, model: str, runs: int, examples: list[dict], results: dict[str, list[dict]], s: dict, cost: dict) -> str:
+def report(tag: str, model: str, runs: int, examples: list[dict], results: dict[str, list[dict]], s: dict, cost: dict,
+           now: datetime) -> str:
     n = s["total"]
     pct = lambda k: f"{s[k]}/{n} ({100 * s[k] / n:.0f}%)"  # noqa: E731
     lines = [
         f"# Eval: {tag}", "",
         f"{len(examples)} labelled examples from `GET /examples`, {runs} run(s) each, model `{model}`, "
-        f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC. Nothing was posted.", "",
+        f"{now:%Y-%m-%d %H:%M} UTC, commit {git_commit()}. Nothing was posted.", "",
         "## Summary", "",
         "| Metric | Result |", "|---|---|",
         f"| **Unsafe replies** (replied where the label says handoff/close; must be 0) | {s['unsafe_replies']} |",
@@ -130,10 +147,18 @@ async def main(tag: str, runs: int) -> None:
     s = score(examples, results)
     usd = (analyzer.tokens_in * PRICE_IN + analyzer.tokens_out * PRICE_OUT) / 1_000_000
     cost = {"tokens_in": analyzer.tokens_in, "tokens_out": analyzer.tokens_out, "per_100": usd / s["total"] * 100}
-    path = Path(f"eval_results/{tag}.md")
-    path.write_text(report(tag, cfg.anthropic_model, runs, examples, results, s, cost), encoding="utf-8")
+    # Every run is kept locally (git-ignored): a full report per run, plus one line per run in history.jsonl.
+    now = datetime.now(timezone.utc)
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    path = RUNS_DIR / f"{now:%Y%m%dT%H%M%SZ}_{tag}.md"
+    path.write_text(report(tag, cfg.anthropic_model, runs, examples, results, s, cost, now), encoding="utf-8")
+    entry = {"time": now.isoformat(timespec="seconds"), "tag": tag, "model": cfg.anthropic_model,
+             "commit": git_commit(), "runs_per_example": runs, "report": path.name,
+             **s, "usd_per_100_tickets": round(cost["per_100"], 4)}
+    with (RUNS_DIR / "history.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
 
-    print(f"Wrote {path}")
+    print(f"Wrote {path} (history: {RUNS_DIR / 'history.jsonl'})")
     print(f"  unsafe replies {s['unsafe_replies']}, missed replies {s['missed_replies']}, "
           f"action {s['action']}/{s['total']}, category {s['category']}/{s['total']}, "
           f"priority {s['priority']}/{s['total']} (within 1: {s['priority_within_1']}), "
@@ -143,7 +168,7 @@ async def main(tag: str, runs: int) -> None:
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Score the agent on the labelled examples")
-    p.add_argument("--tag", required=True, help="name of the result file, e.g. baseline or after_fix")
+    p.add_argument("--tag", default="run", help="label for this run, e.g. baseline or after_fix")
     p.add_argument("--runs", type=int, default=3, help="runs per example (default 3)")
     args = p.parse_args()
     setup_logging(os.getenv("LOG_LEVEL", "WARNING"))
