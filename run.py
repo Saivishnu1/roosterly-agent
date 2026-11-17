@@ -12,7 +12,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from helpdesk import HelpdeskClient
+from helpdesk import HelpdeskClient, HelpdeskError
 
 REQUIRED = ("HELPDESK_URL", "HELPDESK_KEY", "CANDIDATE_EMAIL")
 
@@ -113,4 +113,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except HelpdeskError as e:
+        sys.exit(f"Helpdesk error: {e}")

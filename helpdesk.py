@@ -1,18 +1,53 @@
 """Async client for the Roosterly helpdesk API.
 
-Step 1a: send the right headers and make GET requests. Errors, retries, rate limiting and
-pagination are added in the next steps.
+Every call goes through `_request`, which handles the helpdesk's errors:
+  - 503 and 429 are retried. Both mean the request was not saved, so this is safe for POSTs too.
+  - A timeout or dropped connection is retried for GETs only. For a POST we can't know whether
+    the answer was saved, so we raise UncertainOutcome and let the caller check the ticket.
+  - Everything else (400, 401, 404, 409, 422) is raised at once: retrying would not help.
 """
+import asyncio
+import random
+import sys
+
 import httpx
+
+MAX_ATTEMPTS = 5
+BACKOFF_START = 0.5  # seconds; doubles each attempt
+BACKOFF_MAX = 8.0
+# Errors where the request never reached the server, so even a POST is safe to resend.
+NEVER_SENT = (httpx.ConnectError, httpx.ConnectTimeout)
+
+
+def _backoff(attempt: int) -> float:
+    """0.5s, 1s, 2s, 4s, 8s ... with +-20% jitter so parallel retries don't line up."""
+    return min(BACKOFF_START * 2 ** (attempt - 1), BACKOFF_MAX) * random.uniform(0.8, 1.2)
+
+
+class HelpdeskError(Exception):
+    """The helpdesk refused a request, or kept failing after all retries."""
+
+    def __init__(self, status: int | None, code: str, message: str = "", problems: list | None = None):
+        self.status, self.code, self.problems = status, code, problems or []
+        super().__init__(f"{status} {code}: {message}".strip())
+
+
+class AlreadyHandled(HelpdeskError):
+    """409: this ticket already got an answer. Never retry."""
+
+
+class UncertainOutcome(HelpdeskError):
+    """A POST timed out or the connection dropped: the answer may or may not have been saved."""
 
 
 class HelpdeskClient:
-    def __init__(self, base_url: str, key: str, email: str):
+    def __init__(self, base_url: str, key: str, email: str, sleep=asyncio.sleep):
         self._http = httpx.AsyncClient(
             base_url=base_url,
             headers={"Authorization": f"Bearer {key}", "X-Candidate-Email": email},
             timeout=15.0,
         )
+        self._sleep = sleep  # tests pass a fake so they don't actually wait
 
     async def __aenter__(self) -> "HelpdeskClient":
         return self
@@ -20,22 +55,46 @@ class HelpdeskClient:
     async def __aexit__(self, *exc) -> None:
         await self._http.aclose()
 
+    async def _request(self, method: str, path: str, **kwargs) -> dict:
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            # 1. Send. Each failure below decides how long to wait before the next try.
+            try:
+                resp = await self._http.request(method, path, **kwargs)
+            except httpx.TransportError as e:  # timeout or connection problem, no response
+                if method == "POST" and not isinstance(e, NEVER_SENT):
+                    raise UncertainOutcome(None, type(e).__name__, f"{method} {path}") from e
+                problem, wait = type(e).__name__, _backoff(attempt)
+            else:
+                # 2. We got a response.
+                if resp.is_success:
+                    return resp.json()
+                if resp.status_code == 503:  # nothing was saved
+                    problem, wait = "503", _backoff(attempt)
+                elif resp.status_code == 429:  # too fast, nothing was saved
+                    problem, wait = "429", float(resp.headers.get("Retry-After", 1))
+                else:  # 400, 401, 404, 409, 422: retrying would not help
+                    raise _error_from(resp)
+
+            # 3. Wait and try again (unless that was the last attempt).
+            if attempt < MAX_ATTEMPTS:
+                print(f"helpdesk: {method} {path} -> {problem}, retry {attempt} in {wait:.1f}s", file=sys.stderr)
+                await self._sleep(wait)
+
+        raise HelpdeskError(None, "gave_up", f"{method} {path} still failing after {MAX_ATTEMPTS} attempts ({problem})")
+
     async def get_status(self) -> dict:
-        resp = await self._http.get("/status")
-        return resp.json()
+        return await self._request("GET", "/status")
 
     async def get_examples(self) -> dict:
         """The 10 tickets Nordavo labelled, used for the eval."""
-        resp = await self._http.get("/examples")
-        return resp.json()
+        return await self._request("GET", "/examples")
 
     async def list_tickets(self, limit: int = 10, cursor: str | None = None, status: str = "open") -> dict:
         """One page of tickets (max 10). `status` is "open" (not yet handled) or "all"."""
         params = {"limit": limit, "status": status}
         if cursor:
             params["cursor"] = cursor
-        resp = await self._http.get("/tickets", params=params)
-        return resp.json()
+        return await self._request("GET", "/tickets", params=params)
 
     async def list_open_tickets(self) -> list[dict]:
         """All open tickets, page by page until next_cursor is null."""
@@ -50,17 +109,23 @@ class HelpdeskClient:
 
     async def get_ticket(self, ticket_id: str) -> dict:
         """One ticket, plus how it was handled (if it was)."""
-        resp = await self._http.get(f"/tickets/{ticket_id}")
-        return resp.json()
+        return await self._request("GET", f"/tickets/{ticket_id}")
 
     async def post_decision(self, ticket_id: str, action: str, decision: dict) -> dict:
         """Send the one decision for a ticket. `action` is reply, handoff or close."""
         if action not in ("reply", "handoff", "close"):
             raise ValueError(f"unknown action: {action}")
-        resp = await self._http.post(f"/tickets/{ticket_id}/{action}", json=decision)
-        return resp.json()
+        return await self._request("POST", f"/tickets/{ticket_id}/{action}", json=decision)
 
     async def reset(self) -> dict:
         """Re-open all practice tickets. Changes the helpdesk state."""
-        resp = await self._http.post("/practice/reset")
-        return resp.json()
+        return await self._request("POST", "/practice/reset")
+
+
+def _error_from(resp: httpx.Response) -> HelpdeskError:
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
+    cls = AlreadyHandled if resp.status_code == 409 else HelpdeskError
+    return cls(resp.status_code, body.get("error", "unknown"), body.get("message", ""), body.get("problems"))
