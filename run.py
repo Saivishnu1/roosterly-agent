@@ -16,7 +16,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from helpdesk import HelpdeskClient, HelpdeskError
-from llm import Analysis, Analyzer, ClaudeClient, LLMError
+from llm import Analysis, Analyzer, ClaudeClient, LLMError, Verdict
 from safety import Decision, empty_ticket_decision, gate, is_empty, redact_ticket, rule_hits
 
 REQUIRED = ("HELPDESK_URL", "HELPDESK_KEY", "CANDIDATE_EMAIL")
@@ -78,13 +78,19 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-async def decide(ticket: dict, analyzer: Analyzer, faq_ids: set[str]) -> tuple[Decision, Analysis | None]:
-    """One ticket -> final decision. Raises LLMError if Claude gives no usable answer."""
+async def decide(ticket: dict, analyzer: Analyzer, faq_ids: set[str]) -> tuple[Decision, Analysis | None, Verdict | None]:
+    """One ticket -> final decision. Raises LLMError if Claude gives no usable answer (the ticket stays open)."""
     if is_empty(ticket):
-        return empty_ticket_decision(), None
+        return empty_ticket_decision(), None, None
     safe = redact_ticket(ticket)  # the LLM never sees card numbers or IBANs
     analysis = await analyzer.analyze(safe)
-    return gate(safe, analysis, rule_hits(safe), faq_ids), analysis
+    hits = rule_hits(safe)
+    decision = gate(safe, analysis, hits, faq_ids)
+    if decision.action != "reply":
+        return decision, analysis, None
+    # The code checks passed: now a separate reviewer reads the draft before anything can be sent.
+    verdict = await analyzer.verify(safe, decision.draft_reply)
+    return gate(safe, analysis, hits, faq_ids, verdict), analysis, verdict
 
 
 async def cmd_run(cfg: Config, dry_run: bool, limit: int | None) -> None:
@@ -101,7 +107,7 @@ async def cmd_run(cfg: Config, dry_run: bool, limit: int | None) -> None:
     for t in tickets:
         started = time.monotonic()
         try:
-            d, a = await decide(t, analyzer, faq_ids)
+            d, a, v = await decide(t, analyzer, faq_ids)
         except LLMError as e:
             print(f"{t['id']}  FAILED (left open): {e}\n")
             continue
@@ -117,6 +123,9 @@ async def cmd_run(cfg: Config, dry_run: bool, limit: int | None) -> None:
             print(f"  draft ({d.language}): {d.draft_reply}")
         elif d.action == "handoff":
             print(f"  note:    {d.handoff_note}")
+        if v:  # the reviewer's English translation, so a non-Dutch reader can check every draft
+            print(f"  english: {v.english_translation}")
+            print(f"  review:  {v.explanation}")
         print()
     print(f"Tokens: {analyzer.tokens_in} in, {analyzer.tokens_out} out")
 

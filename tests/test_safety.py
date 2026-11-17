@@ -1,7 +1,7 @@
 """Offline tests for safety.py: redaction, keyword rules and the gate. No network, no LLM."""
 import pytest
 
-from llm import Analysis
+from llm import Analysis, Verdict
 from safety import detect_language, gate, is_empty, redact, rule_hits
 
 FAQ_IDS = {f"F{i:02d}" for i in range(1, 13)}
@@ -176,3 +176,24 @@ def test_unsure_close_becomes_handoff():
 def test_handoff_note_is_redacted():
     h = {**REPLY, "action": "handoff", "draft_reply": "", "handoff_note": "Card 4111 1111 1111 1111 was charged."}
     assert "4111" not in gate(SWAP, Analysis(**h), [], FAQ_IDS).handoff_note
+
+
+# --- gate with the reviewer's verdict -----------------------------------------
+
+OK_VERDICT = Verdict(english_translation="You can swap a shift in the app...", answers_question=True,
+                     unsupported_claims=[], touches_client_rule=False, explanation="Matches F03.")
+
+
+def test_reply_with_clean_verdict_passes():
+    assert gate(SWAP, Analysis(**REPLY), [], FAQ_IDS, OK_VERDICT).action == "reply"
+
+
+@pytest.mark.parametrize("change, expected_check", [
+    ({"answers_question": False}, "does not answer"),
+    ({"unsupported_claims": ["swapping is free until 2027"]}, "not in the help centre"),
+    ({"touches_client_rule": True}, "touches a client rule"),
+])
+def test_reviewer_objection_turns_reply_into_handoff(change, expected_check):
+    d = gate(SWAP, Analysis(**REPLY), [], FAQ_IDS, OK_VERDICT.model_copy(update=change))
+    assert d.action == "handoff"
+    assert any(expected_check in c for c in d.failed_checks)

@@ -5,7 +5,7 @@ import anthropic
 import httpx
 import pytest
 
-from llm import Analysis, Analyzer, ClaudeClient, InvalidAnswer, LLMError, check_analysis
+from llm import Analysis, Analyzer, ClaudeClient, InvalidAnswer, LLMError, Verdict, check_analysis
 
 TICKET = {"id": "T001", "subject": "Wachtwoord", "body": "Ik ben mijn wachtwoord vergeten."}
 GOOD = dict(
@@ -26,8 +26,9 @@ class FakeClaude:
     def __init__(self, *answers):
         self.answers, self.calls = list(answers), 0
 
-    async def ask(self, system, user):
+    async def ask(self, system, user, schema):
         self.calls += 1
+        self.last_user = user
         return self.answers.pop(0)
 
 
@@ -68,6 +69,26 @@ def test_broken_answers_are_rejected(change):
         check_analysis(Analysis(**{**GOOD, **change}))
 
 
+# --- verify (the second, independent call) ------------------------------------
+
+VERDICT = Verdict(english_translation="Go to the login page...", answers_question=True,
+                  unsupported_claims=[], touches_client_rule=False, explanation="Matches F01.")
+
+
+async def test_verify_sends_ticket_and_draft_and_returns_verdict():
+    claude = FakeClaude((VERDICT, "end_turn", 100, 20))
+    v = await Analyzer(claude, faq_text="F01 ...").verify(TICKET, "Ga naar de loginpagina...")
+    assert v.answers_question
+    assert "<ticket>" in claude.last_user and "<draft>" in claude.last_user
+
+
+async def test_verdict_without_translation_is_asked_again():
+    empty = VERDICT.model_copy(update={"english_translation": " "})
+    claude = FakeClaude((empty, "end_turn", 100, 20), (VERDICT, "end_turn", 100, 20))
+    await Analyzer(claude, faq_text="F01 ...").verify(TICKET, "Ga naar de loginpagina...")
+    assert claude.calls == 2
+
+
 # --- ClaudeClient -------------------------------------------------------------
 
 async def test_api_error_becomes_llm_error():
@@ -79,5 +100,5 @@ async def test_api_error_becomes_llm_error():
     claude = ClaudeClient(api_key="test", model="test-model")
     claude._client = SimpleNamespace(messages=SimpleNamespace(parse=parse))
     with pytest.raises(LLMError, match="APIConnectionError") as caught:
-        await claude.ask("system", "user")
+        await claude.ask("system", "user", Analysis)
     assert not isinstance(caught.value, InvalidAnswer)  # so the Analyzer won't ask again

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 from lingua import Language, LanguageDetectorBuilder
 
-from llm import Analysis
+from llm import Analysis, Verdict
 
 MIN_REPLY_CONFIDENCE = 0.75
 MIN_CLOSE_CONFIDENCE = 0.9
@@ -199,8 +199,9 @@ def _raise_priority(priority: str, flags: set[str]) -> str:
     return min([priority, *floors])
 
 
-def gate(ticket: dict, a: Analysis, hits: list[str], faq_ids: set[str]) -> Decision:
-    """Final decision. Plain code decides whether the LLM's reply or close is allowed; otherwise it is a handoff."""
+def gate(ticket: dict, a: Analysis, hits: list[str], faq_ids: set[str], verdict: Verdict | None = None) -> Decision:
+    """Final decision. Plain code decides whether the LLM's reply or close is allowed; otherwise it is a handoff.
+    Called twice for a reply: first without a verdict (is a reply even possible?), then with the reviewer's verdict."""
     flags = set(hits) | set(a.sensitive)
     failed: list[str] = []
 
@@ -223,6 +224,13 @@ def gate(ticket: dict, a: Analysis, hits: list[str], faq_ids: set[str]) -> Decis
             failed.append(f"draft is not in {ticket_lang or a.language}, the customer's language")
         if redact(a.draft_reply) != a.draft_reply:
             failed.append("draft contains payment details")
+        if verdict is not None:  # the independent review of the draft
+            if not verdict.answers_question:
+                failed.append("reviewer: draft does not answer the question")
+            if verdict.unsupported_claims:
+                failed.append(f"reviewer: not in the help centre: {'; '.join(verdict.unsupported_claims)}")
+            if verdict.touches_client_rule:
+                failed.append("reviewer: touches a client rule")
     elif a.action == "close" and a.confidence < MIN_CLOSE_CONFIDENCE:
         failed.append(f"close with confidence {a.confidence:.2f} < {MIN_CLOSE_CONFIDENCE}")
 
