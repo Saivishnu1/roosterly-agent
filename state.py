@@ -10,12 +10,16 @@ The helpdesk stays the source of truth: a run only ever looks at tickets the hel
 """
 import asyncio
 import json
+import logging
 import os
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 from safety import redact
+
+log = logging.getLogger("state")
 
 
 class AlreadyRunning(Exception):
@@ -107,5 +111,16 @@ class TicketLog:
         }
         line = {k: redact(v) if isinstance(v, str) else [redact(c) for c in v] if isinstance(v, list) else v
                 for k, v in line.items()}
-        with self.path.open("a", encoding="utf-8") as f:  # one short append per ticket
-            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+        text = json.dumps(line, ensure_ascii=False) + "\n"
+        # The answer to the customer is already sent, so a log problem must never stop the run: retry briefly
+        # (Windows antivirus can hold a new file for a moment), then warn instead of raising.
+        for attempt in range(5):
+            try:
+                with self.path.open("a", encoding="utf-8") as f:  # one short append per ticket
+                    f.write(text)
+                return
+            except OSError as e:
+                if attempt == 4:
+                    log.warning("could not write the log line for %s: %s", ticket_id, e)
+                else:
+                    time.sleep(0.05)

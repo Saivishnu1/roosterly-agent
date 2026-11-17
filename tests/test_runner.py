@@ -216,3 +216,14 @@ async def test_one_log_line_per_ticket_without_ticket_text_or_payment_details(tm
     assert all(line["outcome"] == "posted reply" and line["category"] == "question" for line in lines)
     assert "4111" not in text and "kaart" not in text          # no ticket text, no card number
     assert DECISION.draft_reply not in text                    # no draft either
+
+
+def test_a_log_write_that_keeps_failing_never_raises(tmp_path, monkeypatch):
+    from pathlib import Path
+    from state import TicketLog
+
+    def locked(*_, **__):
+        raise PermissionError("held by another process")
+    monkeypatch.setattr(Path, "open", locked)
+    monkeypatch.setattr("state.time.sleep", lambda _: None)
+    TicketLog(tmp_path).write("T001", "posted reply", {"action": "reply", "body": {}}, 1.0)  # must not raise
