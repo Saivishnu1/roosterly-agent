@@ -78,6 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def load_faq(path: str = "data/faq.md") -> tuple[str, set[str]]:
+    """The help-centre text and the FAQ ids in it (F01, F02, ...)."""
+    text = Path(path).read_text(encoding="utf-8")
+    return text, set(re.findall(r"^## (F\d+)", text, re.MULTILINE))
+
+
 async def decide(ticket: dict, analyzer: Analyzer, faq_ids: set[str]) -> tuple[Decision, Analysis | None, Verdict | None]:
     """One ticket -> final decision. Raises LLMError if Claude gives no usable answer (the ticket stays open)."""
     if is_empty(ticket):
@@ -96,8 +102,7 @@ async def decide(ticket: dict, analyzer: Analyzer, faq_ids: set[str]) -> tuple[D
 async def cmd_run(cfg: Config, dry_run: bool, limit: int | None) -> None:
     if not dry_run:
         sys.exit("Posting decisions is not built yet. Use --dry-run.")
-    faq = Path("data/faq.md").read_text(encoding="utf-8")
-    faq_ids = set(re.findall(r"^## (F\d+)", faq, re.MULTILINE))
+    faq, faq_ids = load_faq()
     claude = ClaudeClient(cfg.anthropic_api_key, cfg.anthropic_model, timeout=cfg.llm_timeout)
     analyzer = Analyzer(claude, faq)
     async with HelpdeskClient(cfg.helpdesk_url, cfg.helpdesk_key, cfg.candidate_email) as hd:
