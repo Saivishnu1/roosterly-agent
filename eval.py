@@ -10,13 +10,15 @@
     uv run python eval.py --tag quick --runs 1
 
 Every run is stored in eval_results/runs/ (git-ignored): one report per run, and one line per run in
-history.jsonl with the scores and the git commit it ran on. Only eval_results/baseline.md is committed.
+history.jsonl with the scores and the git commit it ran on. The newest run is also copied to
+eval_results/after_fix.md. Committed: baseline.md (before the fix) and after_fix.md (the latest run).
 """
 import argparse
 import asyncio
 import json
 import os
 import subprocess
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +27,7 @@ from run import decide, load_config, load_faq, setup_logging
 
 EXAMPLES = Path("eval_results/examples.json")
 RUNS_DIR = Path("eval_results/runs")
+LATEST = Path("eval_results/after_fix.md")  # committed: the newest run, to compare with baseline.md
 CONCURRENCY = 4
 FIELDS = ("action", "category", "priority", "language")
 PRICE_IN, PRICE_OUT = 0.10, 0.50  # USD per 1M tokens for claude-haiku-5-5
@@ -60,7 +63,9 @@ def priority_distance(a: str, b: str) -> int:
 def score(examples: list[dict], results: dict[str, list[dict]]) -> dict[str, int]:
     """Counts over every (example, run) pair."""
     s = {k: 0 for k in ("total", "errors", "unsafe_replies", "missed_replies", "action", "category",
-                        "priority", "priority_within_1", "language", "unstable_examples")}
+                        "priority", "priority_within_1", "language", "unstable_examples",
+                        "majority_unsafe_replies", "majority_missed_replies",
+                        *(f"majority_{f}" for f in FIELDS))}
     for ex in examples:
         label, runs = ex["label"], results[ex["id"]]
         if len({r.get("action") for r in runs}) > 1:
@@ -77,6 +82,15 @@ def score(examples: list[dict], results: dict[str, list[dict]]) -> dict[str, int
             for f in ("action", "category", "priority", "language"):
                 s[f] += r[f] == label[f]
             s["priority_within_1"] += priority_distance(r["priority"], label["priority"]) <= 1
+
+        # Majority vote: the most common answer for each field across this example's runs.
+        ok = [r for r in runs if "error" not in r]
+        if ok:
+            mode = {f: Counter(r[f] for r in ok).most_common(1)[0][0] for f in FIELDS}
+            for f in FIELDS:
+                s[f"majority_{f}"] += mode[f] == label[f]
+            s["majority_unsafe_replies"] += mode["action"] == "reply" and label["action"] != "reply"
+            s["majority_missed_replies"] += label["action"] == "reply" and mode["action"] != "reply"
     return s
 
 
@@ -102,7 +116,15 @@ def report(tag: str, model: str, runs: int, examples: list[dict], results: dict[
         f"for {n} decisions) |",
     ]
     if runs > 1:
-        lines.append(f"| Examples whose action changed between runs | {s['unstable_examples']}/{len(examples)} |")
+        e = len(examples)
+        lines.append(f"| Examples whose action changed between runs | {s['unstable_examples']}/{e} |")
+        lines += [
+            "", f"## Majority of runs (the most common answer per example, out of {e})", "",
+            "| Metric | Result |", "|---|---|",
+            f"| **Unsafe replies** | {s['majority_unsafe_replies']} |",
+            f"| Missed replies | {s['majority_missed_replies']} |",
+            *(f"| {f.capitalize()} correct | {s['majority_' + f]}/{e} |" for f in FIELDS),
+        ]
     lines += [
         "", "## Per example", "",
         "Each cell is `action / category / priority / language`; a wrong field is in **bold**.", "",
@@ -159,11 +181,16 @@ async def main(tag: str, runs: int) -> None:
         f.write(json.dumps(entry) + "\n")
 
     print(f"Wrote {path} (history: {RUNS_DIR / 'history.jsonl'})")
+    LATEST.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")  # always the newest run
+    print(f"Latest result also in {LATEST}")
     print(f"  unsafe replies {s['unsafe_replies']}, missed replies {s['missed_replies']}, "
           f"action {s['action']}/{s['total']}, category {s['category']}/{s['total']}, "
           f"priority {s['priority']}/{s['total']} (within 1: {s['priority_within_1']}), "
           f"language {s['language']}/{s['total']}, unstable {s['unstable_examples']}, errors {s['errors']}, "
           f"${cost['per_100']:.3f} per 100 tickets")
+    if runs > 1:
+        print(f"  majority of runs: unsafe {s['majority_unsafe_replies']}, missed {s['majority_missed_replies']}, "
+              + ", ".join(f"{f} {s['majority_' + f]}/{len(examples)}" for f in FIELDS))
 
 
 if __name__ == "__main__":
