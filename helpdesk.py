@@ -37,6 +37,17 @@ class HelpdeskClient:
         resp = await self._http.get("/tickets", params=params)
         return resp.json()
 
+    async def list_open_tickets(self) -> list[dict]:
+        """All open tickets, page by page until next_cursor is null."""
+        tickets: list[dict] = []
+        cursor = None
+        while True:
+            page = await self.list_tickets(cursor=cursor)
+            tickets += page["tickets"]
+            cursor = page["next_cursor"]
+            if cursor is None:
+                return tickets
+
     async def get_ticket(self, ticket_id: str) -> dict:
         """One ticket, plus how it was handled (if it was)."""
         resp = await self._http.get(f"/tickets/{ticket_id}")
