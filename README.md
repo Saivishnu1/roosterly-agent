@@ -35,8 +35,9 @@ Keyword rules are a backstop written from the client's rules, not a complete det
 
 ## Reliability
 
-- **503**: backoff with jitter, max 5. **429**: wait `Retry-After`. **409**: never retried. A POST that times out is
-  checked against the ticket before it is ever resent.
+- **503**: backoff with jitter, max 5. **429**: all workers share one limiter (one request per 0.25 s, so at most 4 per
+  second, under the limit of 5); if a 429 still comes back, wait `Retry-After`. **409**: never retried. A POST that
+  times out is checked against the ticket before it is ever resent.
 - **Crash**: each decision is saved as "posting" *before* the POST; the next run asks the helpdesk whether it went
   through and re-sends only the saved decision, with no new LLM call. One run at a time (file lock). Tested live: a run
   hard-killed after 6 tickets, the next run did the other 24, none answered twice. A ticket stuck over 180 s is left open.
@@ -63,7 +64,7 @@ per million: (152,134 × 0.10 + 13,413 × 0.50) / 1,000,000 = $0.022 for 30 → 
 
 ## What I would improve
 
-- **Next:** a shared helpdesk rate limiter (429s are only waited out, fine at 3 workers); hand-off for other languages.
+- **Next:** hand off tickets in languages other than nl / en / de, and try more workers against the rate limiter.
 - The reviewer is strict on "where to find it" replies, and some feature requests are still handed off (T020).
 - **In the brief** I would change the priority table: "one customer blocked" and "money is involved" read very
   differently to people and models; two examples per level would remove most disagreement.

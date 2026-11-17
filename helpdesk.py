@@ -9,6 +9,7 @@ Every call goes through `_request`, which handles the helpdesk's errors:
 import asyncio
 import logging
 import random
+import time
 
 import httpx
 
@@ -19,6 +20,9 @@ BACKOFF_START = 0.5  # seconds; doubles each attempt
 BACKOFF_MAX = 8.0
 # Errors where the request never reached the server, so even a POST is safe to resend.
 NEVER_SENT = (httpx.ConnectError, httpx.ConnectTimeout)
+# The helpdesk allows 5 requests per second. We keep 1 in 5 in reserve: one request every 0.25 s = 4 per second,
+# shared by all workers, so we stay under the limit instead of being rejected with 429.
+MIN_GAP = 0.25
 
 
 def _backoff(attempt: int) -> float:
@@ -50,6 +54,8 @@ class HelpdeskClient:
             timeout=15.0,
         )
         self._sleep = sleep  # tests pass a fake so they don't actually wait
+        self._next_slot = 0.0  # the earliest time the next request may be sent (time.monotonic)
+        self._slot_lock = asyncio.Lock()
 
     async def __aenter__(self) -> "HelpdeskClient":
         return self
@@ -57,8 +63,19 @@ class HelpdeskClient:
     async def __aexit__(self, *exc) -> None:
         await self._http.aclose()
 
+    async def _wait_for_slot(self) -> None:
+        """Rate limit: every request, from any worker and including retries, takes the next free time slot
+        (0.25 s apart). The lock is held only to hand out the slot; the waiting happens outside it."""
+        async with self._slot_lock:
+            now = time.monotonic()
+            slot = max(now, self._next_slot)
+            self._next_slot = slot + MIN_GAP
+        if slot > now:
+            await self._sleep(slot - now)
+
     async def _request(self, method: str, path: str, **kwargs) -> dict:
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            await self._wait_for_slot()
             # 1. Send. Each failure below decides how long to wait before the next try.
             try:
                 resp = await self._http.request(method, path, **kwargs)

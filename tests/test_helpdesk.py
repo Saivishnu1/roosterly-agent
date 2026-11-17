@@ -1,4 +1,6 @@
 """Offline tests for helpdesk.py: the helpdesk is mocked with respx, nothing goes over the network."""
+import asyncio
+
 import httpx
 import pytest
 import respx
@@ -51,7 +53,7 @@ async def test_429_waits_retry_after(respx_mock, client):
     limited = httpx.Response(429, headers={"Retry-After": "2"}, json={"error": "rate_limited"})
     respx_mock.get("/status").mock(side_effect=[limited, ok()])
     await client.get_status()
-    assert client.sleeps == [2.0]
+    assert client.sleeps[0] == 2.0  # the first wait is Retry-After (later ones are just rate-limit spacing)
 
 
 @respx.mock(base_url=BASE)
@@ -129,3 +131,16 @@ async def test_iter_open_tickets_follows_cursor_one_page_at_a_time(respx_mock, c
             assert route.call_count == 1  # page 2 is not fetched while page 1 is still being used
     assert seen == ["T001", "T002", "T003"]
     assert route.calls[1].request.url.params["cursor"] == "T002"
+
+
+# --- rate limit -------------------------------------------------------------
+
+@respx.mock(base_url=BASE)
+async def test_requests_from_many_workers_are_spaced_to_at_most_4_per_second(respx_mock, client):
+    respx_mock.get("/status").mock(return_value=ok())
+    await asyncio.gather(*(client.get_status() for _ in range(10)))  # ten workers ask at the same instant
+    waits = sorted(client.sleeps)
+    assert len(waits) == 9                       # the first goes at once, the other nine each wait their turn
+    gaps = [b - a for a, b in zip(waits, waits[1:])]
+    assert all(abs(g - 0.25) < 0.02 for g in gaps)   # one request per 0.25 s = 4 per second
+    assert waits[-1] >= 9 * 0.25 - 0.05          # so ten requests take about 2.25 s, never a burst
