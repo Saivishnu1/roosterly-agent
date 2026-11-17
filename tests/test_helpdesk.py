@@ -117,10 +117,15 @@ async def test_401_is_not_retried(respx_mock, client):
 # --- pagination -------------------------------------------------------------
 
 @respx.mock(base_url=BASE)
-async def test_list_open_tickets_follows_cursor(respx_mock, client):
-    respx_mock.get("/tickets").mock(side_effect=[
+async def test_iter_open_tickets_follows_cursor_one_page_at_a_time(respx_mock, client):
+    route = respx_mock.get("/tickets").mock(side_effect=[
         ok({"tickets": [{"id": "T001"}, {"id": "T002"}], "next_cursor": "T002"}),
         ok({"tickets": [{"id": "T003"}], "next_cursor": None}),
     ])
-    tickets = await client.list_open_tickets()
-    assert [t["id"] for t in tickets] == ["T001", "T002", "T003"]
+    seen = []
+    async for t in client.iter_open_tickets():
+        seen.append(t["id"])
+        if t["id"] == "T001":
+            assert route.call_count == 1  # page 2 is not fetched while page 1 is still being used
+    assert seen == ["T001", "T002", "T003"]
+    assert route.calls[1].request.url.params["cursor"] == "T002"

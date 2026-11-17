@@ -98,16 +98,18 @@ class HelpdeskClient:
             params["cursor"] = cursor
         return await self._request("GET", "/tickets", params=params)
 
-    async def list_open_tickets(self) -> list[dict]:
-        """All open tickets, page by page until next_cursor is null."""
-        tickets: list[dict] = []
+    async def iter_open_tickets(self):
+        """Yield open tickets one by one, fetching the next page only when this one is used up,
+        so at most one page is in memory however many tickets are open.
+        The cursor is the last ticket id, so tickets we handle meanwhile do not shift the pages."""
         cursor = None
         while True:
             page = await self.list_tickets(cursor=cursor)
-            tickets += page["tickets"]
+            for ticket in page["tickets"]:
+                yield ticket
             cursor = page["next_cursor"]
             if cursor is None:
-                return tickets
+                return
 
     async def get_ticket(self, ticket_id: str) -> dict:
         """One ticket, plus how it was handled (if it was)."""

@@ -10,14 +10,22 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-from helpdesk import HelpdeskClient, HelpdeskError
+from helpdesk import AlreadyHandled, HelpdeskClient, HelpdeskError, UncertainOutcome
 from llm import Analysis, Analyzer, ClaudeClient, LLMError, Verdict
 from safety import Decision, empty_ticket_decision, gate, is_empty, redact_ticket, rule_hits
+from state import AlreadyRunning, StateFile, single_run
+
+log = logging.getLogger("run")
+
+# Most tickets take 3-10 s. The limit stops one slow ticket (e.g. an API having a bad day, with all its
+# retries) from holding a worker for many minutes; it is left open and picked up by the next run.
+TICKET_TIMEOUT = 180
 
 REQUIRED = ("HELPDESK_URL", "HELPDESK_KEY", "CANDIDATE_EMAIL")
 
@@ -72,9 +80,10 @@ def build_parser() -> argparse.ArgumentParser:
     t = sub.add_parser("tickets", help="list one page of open tickets (read-only)")
     t.add_argument("--cursor", help="next_cursor printed by the previous page")
     sub.add_parser("reset", help="re-open all 30 practice tickets (CHANGES helpdesk state)")
-    r = sub.add_parser("run", help="analyse open tickets with the LLM")
+    r = sub.add_parser("run", help="decide and post one decision per open ticket (CHANGES helpdesk state)")
     r.add_argument("--dry-run", action="store_true", help="print decisions, post nothing")
     r.add_argument("--limit", type=int, help="only the first N open tickets")
+    r.add_argument("--workers", type=int, default=3, help="tickets handled in parallel (default 3)")
     return p
 
 
@@ -99,39 +108,153 @@ async def decide(ticket: dict, analyzer: Analyzer, faq_ids: set[str]) -> tuple[D
     return gate(safe, analysis, hits, faq_ids, verdict), analysis, verdict
 
 
-async def cmd_run(cfg: Config, dry_run: bool, limit: int | None) -> None:
-    if not dry_run:
-        sys.exit("Posting decisions is not built yet. Use --dry-run.")
+async def post_ticket(ticket: dict, hd: HelpdeskClient, analyzer: Analyzer, faq_ids: set[str],
+                      state: StateFile) -> str:
+    """Decide and post one ticket so the customer gets exactly one answer, even across crashes.
+    Returns a short outcome for the summary."""
+    tid = ticket["id"]
+    record = state.get(tid)
+    if record and record["status"] == "posting":
+        # A previous run stopped during the POST. Did the answer get through?
+        if (await hd.get_ticket(tid)).get("handled"):
+            await state.save(tid, **{**record, "status": "done", "outcome": "posted before a crash"})
+            return "already posted before a crash"
+        action, body = record["action"], record["body"]  # re-send exactly what we decided then
+        log.warning("%s: resending the decision saved before a crash", tid)
+    else:
+        try:
+            d, _, _ = await decide(ticket, analyzer, faq_ids)
+        except LLMError as e:
+            log.error("%s: no decision, left open: %s", tid, e)
+            return "failed: no decision (left open)"
+        action, body = d.action, d.body()
+        await state.save(tid, status="posting", action=action, body=body)  # BEFORE the POST
+    return await send(hd, state, tid, action, body)
+
+
+async def send(hd: HelpdeskClient, state: StateFile, tid: str, action: str, body: dict) -> str:
+    """POST a saved decision and record the result. Handles each error as api_reference.md says."""
+    try:
+        await hd.post_decision(tid, action, body)
+        outcome = f"posted {action}"
+    except AlreadyHandled:
+        # 409: "Do not retry. Your agent should not have sent this." The state file should prevent it.
+        log.error("%s: already handled (409); not sent again. Our crash protection should have caught this", tid)
+        outcome = "already handled (409)"
+    except UncertainOutcome:
+        # The POST went out but no answer came back: check before sending again.
+        if not (await hd.get_ticket(tid)).get("handled"):
+            await hd.post_decision(tid, action, body)  # if uncertain again, it stays "posting" for the next run
+        outcome = f"posted {action}"
+    except HelpdeskError as e:
+        if e.status == 401:  # wrong key: stop the whole run
+            raise
+        if e.status in (400, 422):  # "Fix the body": decide again next run instead of resending this one
+            log.error("%s: helpdesk rejected the decision: %s %s", tid, e, e.problems)
+            await state.save(tid, status="rejected", action=action, body=body, error=str(e))
+            return f"failed: rejected ({e.status}), left open"
+        if e.status == 404:  # "a ticket that is not in your current set"
+            log.error("%s: not in the current ticket set (404)", tid)
+            return "failed: unknown ticket (404)"
+        # 503/429 still failing after all retries: nothing was saved; the next run checks and resends
+        log.error("%s: could not post, will check again next run: %s", tid, e)
+        return "failed: could not post (left as posting)"
+    await state.save(tid, status="done", action=action, body=body, outcome=outcome)
+    return outcome
+
+
+async def produce(hd: HelpdeskClient, queue: asyncio.Queue, workers: int, limit: int | None) -> None:
+    """Stream open tickets into the queue page by page; the queue is bounded, so this waits while it is full."""
+    count = 0
+    async for ticket in hd.iter_open_tickets():
+        if limit and count >= limit:
+            break
+        await queue.put(ticket)
+        count += 1
+    for _ in range(workers):
+        await queue.put(None)  # one stop signal per worker
+
+
+async def post_all(hd: HelpdeskClient, analyzer: Analyzer, faq_ids: set[str], workers: int, limit: int | None,
+                   ticket_timeout: float = TICKET_TIMEOUT) -> None:
+    """Post one decision per open ticket. A producer streams tickets into a small queue and `workers` tasks
+    handle them in parallel, so only a few tickets are in memory however many are open."""
+    state = StateFile()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=workers * 2)
+    outcomes: Counter = Counter()
+
+    async def worker() -> None:
+        while (ticket := await queue.get()) is not None:
+            try:
+                outcome = await asyncio.wait_for(post_ticket(ticket, hd, analyzer, faq_ids, state), ticket_timeout)
+            except TimeoutError:
+                # Give up on this ticket so the worker can move on. Safe even mid-POST: the decision was saved
+                # as "posting" first, so the next run checks the helpdesk before sending anything.
+                log.error("%s: took longer than %ss, left for the next run", ticket["id"], ticket_timeout)
+                outcome = f"failed: took longer than {ticket_timeout:g}s (left open)"
+            except HelpdeskError as e:
+                if e.status == 401:
+                    raise  # wrong key: stop everything
+                outcome = f"failed: {e}"
+            except Exception as e:  # one broken ticket must not stop the others
+                log.exception("%s: unexpected error", ticket["id"])
+                outcome = f"failed: unexpected {type(e).__name__}"
+            print(f"{ticket['id']}  {outcome}")
+            outcomes[outcome] += 1
+
+    await asyncio.gather(produce(hd, queue, workers, limit), *(worker() for _ in range(workers)))
+    print("\nSummary: " + (", ".join(f"{n} {o}" for o, n in sorted(outcomes.items())) or "no open tickets"))
+    print(f"Tokens: {analyzer.tokens_in} in, {analyzer.tokens_out} out")
+    if any(o.startswith("failed") for o in outcomes):
+        sys.exit(1)  # some tickets are still open: run again
+
+
+def print_decision(t: dict, d: Decision, a: Analysis | None, v: Verdict | None, seconds: float) -> None:
+    """Dry run: show everything about one decision, with English for every Dutch text."""
+    overruled = f"  (LLM said {a.action})" if a and a.action != d.action else ""
+    print(f"{t['id']}  {d.language}  {d.category:<15} {d.priority}  {d.action:<7} conf {d.confidence:.2f}"
+          f"{overruled}  [{seconds:.1f}s]")
+    if a:
+        print(f"  summary: {a.english_summary}")
+    print(f"  reason:  {d.reason}")
+    if d.failed_checks:
+        print(f"  checks:  {'; '.join(d.failed_checks)}")
+    if d.action == "reply":
+        print(f"  draft ({d.language}): {d.draft_reply}")
+    elif d.action == "handoff":
+        print(f"  note:    {d.handoff_note}")
+    if v:  # the reviewer's English translation, so a non-Dutch reader can check every draft
+        print(f"  english: {v.english_translation}")
+        print(f"  review:  {v.explanation}")
+    print()
+
+
+async def cmd_run(cfg: Config, dry_run: bool, limit: int | None, workers: int) -> None:
     faq, faq_ids = load_faq()
     claude = ClaudeClient(cfg.anthropic_api_key, cfg.anthropic_model, timeout=cfg.llm_timeout)
     analyzer = Analyzer(claude, faq)
     async with HelpdeskClient(cfg.helpdesk_url, cfg.helpdesk_key, cfg.candidate_email) as hd:
-        tickets = await hd.list_open_tickets()
-    tickets = tickets[:limit] if limit else tickets
-    print(f"Analysing {len(tickets)} ticket(s) with {cfg.anthropic_model}. DRY RUN: nothing is posted.\n")
-    for t in tickets:
-        started = time.monotonic()
-        try:
-            d, a, v = await decide(t, analyzer, faq_ids)
-        except LLMError as e:
-            print(f"{t['id']}  FAILED (left open): {e}\n")
-            continue
-        overruled = f"  (LLM said {a.action})" if a and a.action != d.action else ""
-        print(f"{t['id']}  {d.language}  {d.category:<15} {d.priority}  {d.action:<7} conf {d.confidence:.2f}"
-              f"{overruled}  [{time.monotonic() - started:.1f}s]")
-        if a:
-            print(f"  summary: {a.english_summary}")
-        print(f"  reason:  {d.reason}")
-        if d.failed_checks:
-            print(f"  checks:  {'; '.join(d.failed_checks)}")
-        if d.action == "reply":
-            print(f"  draft ({d.language}): {d.draft_reply}")
-        elif d.action == "handoff":
-            print(f"  note:    {d.handoff_note}")
-        if v:  # the reviewer's English translation, so a non-Dutch reader can check every draft
-            print(f"  english: {v.english_translation}")
-            print(f"  review:  {v.explanation}")
-        print()
+        if not dry_run:
+            try:
+                with single_run():
+                    print(f"Posting one decision per open ticket with {cfg.anthropic_model}, {workers} workers.\n")
+                    await post_all(hd, analyzer, faq_ids, workers, limit)
+            except AlreadyRunning as e:
+                sys.exit(f"Not started: {e}")
+            return
+        print(f"Analysing open tickets with {cfg.anthropic_model}. DRY RUN: nothing is posted.\n")
+        count = 0
+        async for t in hd.iter_open_tickets():  # streamed page by page, like the real run
+            if limit and count >= limit:
+                break
+            count += 1
+            started = time.monotonic()
+            try:
+                d, a, v = await decide(t, analyzer, faq_ids)
+            except LLMError as e:
+                print(f"{t['id']}  FAILED (left open): {e}\n")
+                continue
+            print_decision(t, d, a, v, time.monotonic() - started)
     print(f"Tokens: {analyzer.tokens_in} in, {analyzer.tokens_out} out")
 
 
@@ -151,6 +274,8 @@ async def cmd_tickets(cfg: Config, cursor: str | None) -> None:
 async def cmd_reset(cfg: Config) -> None:
     async with HelpdeskClient(cfg.helpdesk_url, cfg.helpdesk_key, cfg.candidate_email) as hd:
         print(json.dumps(await hd.reset(), indent=2))
+    StateFile().clear()  # the helpdesk re-opened every ticket, so old records no longer apply
+    print("Cleared state/decisions.json")
 
 
 async def cmd_examples(cfg: Config) -> None:
@@ -187,7 +312,7 @@ def main() -> None:
     elif args.command == "reset":
         asyncio.run(cmd_reset(load_config()))
     elif args.command == "run":
-        asyncio.run(cmd_run(load_config(need_llm=True), args.dry_run, args.limit))
+        asyncio.run(cmd_run(load_config(need_llm=True), args.dry_run, args.limit, args.workers))
 
 
 if __name__ == "__main__":
