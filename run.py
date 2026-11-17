@@ -5,14 +5,17 @@ Phase 0: config loading and the CLI skeleton. Commands are added phase by phase.
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from helpdesk import HelpdeskClient, HelpdeskError
+from llm import Analyzer, ClaudeClient, LLMError
 
 REQUIRED = ("HELPDESK_URL", "HELPDESK_KEY", "CANDIDATE_EMAIL")
 
@@ -22,14 +25,15 @@ class Config:
     helpdesk_url: str
     helpdesk_key: str
     candidate_email: str
-    gemini_api_key: str
-    gemini_model: str
+    anthropic_api_key: str
+    anthropic_model: str
+    llm_timeout: float
 
     def __repr__(self) -> str:  # never print secrets
         return (
             f"Config(helpdesk_url={self.helpdesk_url!r}, helpdesk_key={mask(self.helpdesk_key)}, "
-            f"candidate_email={self.candidate_email!r}, gemini_api_key={mask(self.gemini_api_key)}, "
-            f"gemini_model={self.gemini_model!r})"
+            f"candidate_email={self.candidate_email!r}, anthropic_api_key={mask(self.anthropic_api_key)}, "
+            f"anthropic_model={self.anthropic_model!r}, llm_timeout={self.llm_timeout})"
         )
 
 
@@ -43,16 +47,17 @@ def load_config(need_llm: bool = False) -> Config:
     """Read settings from environment variables (a local .env is loaded if present)."""
     load_dotenv()
     missing = [k for k in REQUIRED if not os.getenv(k)]
-    if need_llm and not os.getenv("GEMINI_API_KEY"):
-        missing.append("GEMINI_API_KEY")
+    if need_llm and not os.getenv("ANTHROPIC_API_KEY"):
+        missing.append("ANTHROPIC_API_KEY")
     if missing:
         sys.exit(f"Missing environment variables: {', '.join(missing)} (see .env.example)")
     return Config(
         helpdesk_url=os.environ["HELPDESK_URL"].rstrip("/"),
         helpdesk_key=os.environ["HELPDESK_KEY"],
         candidate_email=os.environ["CANDIDATE_EMAIL"],
-        gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
-        gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+        anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-5-5"),
+        llm_timeout=float(os.getenv("LLM_TIMEOUT", "60")),
     )
 
 
@@ -65,8 +70,40 @@ def build_parser() -> argparse.ArgumentParser:
     t = sub.add_parser("tickets", help="list one page of open tickets (read-only)")
     t.add_argument("--cursor", help="next_cursor printed by the previous page")
     sub.add_parser("reset", help="re-open all 30 practice tickets (CHANGES helpdesk state)")
-    # Later phases: run
+    r = sub.add_parser("run", help="analyse open tickets with the LLM")
+    r.add_argument("--dry-run", action="store_true", help="print decisions, post nothing")
+    r.add_argument("--limit", type=int, help="only the first N open tickets")
     return p
+
+
+async def cmd_run(cfg: Config, dry_run: bool, limit: int | None) -> None:
+    if not dry_run:
+        sys.exit("Posting decisions is not built yet. Use --dry-run.")
+    faq = Path("data/faq.md").read_text(encoding="utf-8")
+    claude = ClaudeClient(cfg.anthropic_api_key, cfg.anthropic_model, timeout=cfg.llm_timeout)
+    analyzer = Analyzer(claude, faq)
+    async with HelpdeskClient(cfg.helpdesk_url, cfg.helpdesk_key, cfg.candidate_email) as hd:
+        tickets = await hd.list_open_tickets()
+    tickets = tickets[:limit] if limit else tickets
+    print(f"Analysing {len(tickets)} ticket(s) with {cfg.anthropic_model}. DRY RUN: nothing is posted.\n")
+    for t in tickets:
+        started = time.monotonic()
+        try:
+            a = await analyzer.analyze(t)
+        except LLMError as e:
+            print(f"{t['id']}  FAILED: {e}\n")
+            continue
+        print(f"{t['id']}  {a.language}  {a.category:<15} {a.priority}  {a.action:<7} "
+              f"conf {a.confidence:.2f}  faq {','.join(a.faq_ids) or '-'}  sensitive {','.join(a.sensitive) or '-'}"
+              f"  [{time.monotonic() - started:.1f}s]")
+        print(f"  summary: {a.english_summary}")
+        print(f"  reason:  {a.reason}")
+        if a.action == "reply":
+            print(f"  draft ({a.language}): {a.draft_reply}")
+        elif a.action == "handoff":
+            print(f"  note:    {a.handoff_note}")
+        print()
+    print(f"Tokens: {analyzer.tokens_in} in, {analyzer.tokens_out} out")
 
 
 async def cmd_status(cfg: Config) -> None:
@@ -98,8 +135,18 @@ async def cmd_examples(cfg: Config) -> None:
         print(f"  {ex['id']}  {lab['language']}  {lab['category']:<16} {lab['priority']}  {lab['action']}")
 
 
+def setup_logging(level: str) -> None:
+    """One format for every log line (helpdesk retries, LLM calls, ...), on stderr."""
+    logging.basicConfig(level=level.upper(), format="%(asctime)s %(levelname)-7s %(name)-17s %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S", stream=sys.stderr)
+    for noisy in ("httpx", "httpx2"):  # they log every HTTP request at INFO
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 def main() -> None:
     args = build_parser().parse_args()
+    load_dotenv()
+    setup_logging(os.getenv("LOG_LEVEL", "INFO"))
     if args.command == "config":
         print(load_config())
     elif args.command == "status":
@@ -110,6 +157,8 @@ def main() -> None:
         asyncio.run(cmd_examples(load_config()))
     elif args.command == "reset":
         asyncio.run(cmd_reset(load_config()))
+    elif args.command == "run":
+        asyncio.run(cmd_run(load_config(need_llm=True), args.dry_run, args.limit))
 
 
 if __name__ == "__main__":

@@ -7,10 +7,12 @@ Every call goes through `_request`, which handles the helpdesk's errors:
   - Everything else (400, 401, 404, 409, 422) is raised at once: retrying would not help.
 """
 import asyncio
+import logging
 import random
-import sys
 
 import httpx
+
+log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 5
 BACKOFF_START = 0.5  # seconds; doubles each attempt
@@ -77,7 +79,7 @@ class HelpdeskClient:
 
             # 3. Wait and try again (unless that was the last attempt).
             if attempt < MAX_ATTEMPTS:
-                print(f"helpdesk: {method} {path} -> {problem}, retry {attempt} in {wait:.1f}s", file=sys.stderr)
+                log.warning("%s %s -> %s, retry %d in %.1fs", method, path, problem, attempt, wait)
                 await self._sleep(wait)
 
         raise HelpdeskError(None, "gave_up", f"{method} {path} still failing after {MAX_ATTEMPTS} attempts ({problem})")
