@@ -20,9 +20,9 @@ BACKOFF_START = 0.5  # seconds; doubles each attempt
 BACKOFF_MAX = 8.0
 # Errors where the request never reached the server, so even a POST is safe to resend.
 NEVER_SENT = (httpx.ConnectError, httpx.ConnectTimeout)
-# The helpdesk allows 5 requests per second. We keep 1 in 5 in reserve: one request every 0.25 s = 4 per second,
-# shared by all workers, so we stay under the limit instead of being rejected with 429.
-MIN_GAP = 0.25
+# The helpdesk allows 5 requests per second. One request every 0.3 s is about 3 per second, shared by all workers:
+# a safe margin, because wake-up timing is never perfectly even (at 0.25 s a 429 still got through in a live run).
+MIN_GAP = 0.3
 
 
 def _backoff(attempt: int) -> float:
@@ -65,7 +65,7 @@ class HelpdeskClient:
 
     async def _wait_for_slot(self) -> None:
         """Rate limit: every request, from any worker and including retries, takes the next free time slot
-        (0.25 s apart). The lock is held only to hand out the slot; the waiting happens outside it."""
+        (0.3 s apart). The lock is held only to hand out the slot; the waiting happens outside it."""
         async with self._slot_lock:
             now = time.monotonic()
             slot = max(now, self._next_slot)

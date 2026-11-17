@@ -136,11 +136,11 @@ async def test_iter_open_tickets_follows_cursor_one_page_at_a_time(respx_mock, c
 # --- rate limit -------------------------------------------------------------
 
 @respx.mock(base_url=BASE)
-async def test_requests_from_many_workers_are_spaced_to_at_most_4_per_second(respx_mock, client):
+async def test_requests_from_many_workers_are_spaced_about_3_per_second(respx_mock, client):
     respx_mock.get("/status").mock(return_value=ok())
     await asyncio.gather(*(client.get_status() for _ in range(10)))  # ten workers ask at the same instant
     waits = sorted(client.sleeps)
     assert len(waits) == 9                       # the first goes at once, the other nine each wait their turn
     gaps = [b - a for a, b in zip(waits, waits[1:])]
-    assert all(abs(g - 0.25) < 0.02 for g in gaps)   # one request per 0.25 s = 4 per second
-    assert waits[-1] >= 9 * 0.25 - 0.05          # so ten requests take about 2.25 s, never a burst
+    assert all(abs(g - 0.3) < 0.02 for g in gaps)   # one request per 0.3 s, about 3 per second
+    assert waits[-1] >= 9 * 0.3 - 0.05           # so ten requests take about 2.7 s, never a burst

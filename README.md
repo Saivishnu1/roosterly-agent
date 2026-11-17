@@ -35,7 +35,7 @@ Keyword rules are a backstop written from the client's rules, not a complete det
 
 ## Reliability
 
-- **503**: backoff with jitter, max 5. **429**: all workers share one limiter (one request per 0.25 s, so at most 4 per
+- **503**: backoff with jitter, max 5. **429**: all workers share one limiter (one request per 0.3 s, about 3 per
   second, under the limit of 5); if a 429 still comes back, wait `Retry-After`. **409**: never retried. A POST that
   times out is checked against the ticket before it is ever resent.
 - **Crash**: each decision is saved as "posting" *before* the POST; the next run asks the helpdesk whether it went
