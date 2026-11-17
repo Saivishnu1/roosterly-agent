@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -15,7 +16,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from helpdesk import HelpdeskClient, HelpdeskError
-from llm import Analyzer, ClaudeClient, LLMError
+from llm import Analysis, Analyzer, ClaudeClient, LLMError
+from safety import Decision, empty_ticket_decision, gate, is_empty, redact_ticket, rule_hits
 
 REQUIRED = ("HELPDESK_URL", "HELPDESK_KEY", "CANDIDATE_EMAIL")
 
@@ -76,10 +78,20 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+async def decide(ticket: dict, analyzer: Analyzer, faq_ids: set[str]) -> tuple[Decision, Analysis | None]:
+    """One ticket -> final decision. Raises LLMError if Claude gives no usable answer."""
+    if is_empty(ticket):
+        return empty_ticket_decision(), None
+    safe = redact_ticket(ticket)  # the LLM never sees card numbers or IBANs
+    analysis = await analyzer.analyze(safe)
+    return gate(safe, analysis, rule_hits(safe), faq_ids), analysis
+
+
 async def cmd_run(cfg: Config, dry_run: bool, limit: int | None) -> None:
     if not dry_run:
         sys.exit("Posting decisions is not built yet. Use --dry-run.")
     faq = Path("data/faq.md").read_text(encoding="utf-8")
+    faq_ids = set(re.findall(r"^## (F\d+)", faq, re.MULTILINE))
     claude = ClaudeClient(cfg.anthropic_api_key, cfg.anthropic_model, timeout=cfg.llm_timeout)
     analyzer = Analyzer(claude, faq)
     async with HelpdeskClient(cfg.helpdesk_url, cfg.helpdesk_key, cfg.candidate_email) as hd:
@@ -89,19 +101,22 @@ async def cmd_run(cfg: Config, dry_run: bool, limit: int | None) -> None:
     for t in tickets:
         started = time.monotonic()
         try:
-            a = await analyzer.analyze(t)
+            d, a = await decide(t, analyzer, faq_ids)
         except LLMError as e:
-            print(f"{t['id']}  FAILED: {e}\n")
+            print(f"{t['id']}  FAILED (left open): {e}\n")
             continue
-        print(f"{t['id']}  {a.language}  {a.category:<15} {a.priority}  {a.action:<7} "
-              f"conf {a.confidence:.2f}  faq {','.join(a.faq_ids) or '-'}  sensitive {','.join(a.sensitive) or '-'}"
-              f"  [{time.monotonic() - started:.1f}s]")
-        print(f"  summary: {a.english_summary}")
-        print(f"  reason:  {a.reason}")
-        if a.action == "reply":
-            print(f"  draft ({a.language}): {a.draft_reply}")
-        elif a.action == "handoff":
-            print(f"  note:    {a.handoff_note}")
+        overruled = f"  (LLM said {a.action})" if a and a.action != d.action else ""
+        print(f"{t['id']}  {d.language}  {d.category:<15} {d.priority}  {d.action:<7} conf {d.confidence:.2f}"
+              f"{overruled}  [{time.monotonic() - started:.1f}s]")
+        if a:
+            print(f"  summary: {a.english_summary}")
+        print(f"  reason:  {d.reason}")
+        if d.failed_checks:
+            print(f"  checks:  {'; '.join(d.failed_checks)}")
+        if d.action == "reply":
+            print(f"  draft ({d.language}): {d.draft_reply}")
+        elif d.action == "handoff":
+            print(f"  note:    {d.handoff_note}")
         print()
     print(f"Tokens: {analyzer.tokens_in} in, {analyzer.tokens_out} out")
 
