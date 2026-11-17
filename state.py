@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from safety import redact
+
 
 class AlreadyRunning(Exception):
     """Another run holds the lock."""
@@ -74,3 +76,36 @@ class StateFile:
     def clear(self) -> None:
         self._data = {}
         self.path.unlink(missing_ok=True)
+
+
+class TicketLog:
+    """logs/run_<UTC time>.jsonl: one line per ticket a run handled.
+
+    Only ids and decision fields: never the ticket text, the draft, the note or the reason, and every string
+    is passed through redact() once more, so no payment details can end up in a log.
+    Each line is written as soon as its ticket is finished, so a crash keeps everything logged before it."""
+
+    def __init__(self, folder: str | Path = "logs"):
+        folder = Path(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        self.path = folder / f"run_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.jsonl"
+
+    def write(self, ticket_id: str, outcome: str, record: dict | None, seconds: float) -> None:
+        record = record or {}
+        body = record.get("body", {})
+        line = {
+            "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ticket": ticket_id,
+            "outcome": outcome,
+            "action": record.get("action"),
+            "language": body.get("language"),
+            "category": body.get("category"),
+            "priority": body.get("priority"),
+            "confidence": body.get("confidence"),
+            "checks_failed": record.get("checks", []),
+            "seconds": round(seconds, 1),
+        }
+        line = {k: redact(v) if isinstance(v, str) else [redact(c) for c in v] if isinstance(v, list) else v
+                for k, v in line.items()}
+        with self.path.open("a", encoding="utf-8") as f:  # one short append per ticket
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")

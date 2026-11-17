@@ -1,6 +1,7 @@
 """Offline tests for posting (run.post_ticket): one answer per customer, even across crashes and errors.
 The helpdesk is mocked with respx; decide() is replaced, so no LLM is called."""
 import asyncio
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -191,3 +192,27 @@ async def test_slow_ticket_is_abandoned_and_others_still_get_posted(tmp_path, mo
 
     posted = sorted(str(c.request.url).split("/")[-2] for c in posts.calls)
     assert posted == ["T001", "T003", "T004"]  # the slow one is left open, the rest went through
+
+
+@respx.mock
+async def test_one_log_line_per_ticket_without_ticket_text_or_payment_details(tmp_path, monkeypatch, decide_calls):
+    monkeypatch.chdir(tmp_path)
+    secret_body = "Mijn kaart 4111 1111 1111 1111 is geblokkeerd, graag nieuwe betaalmethode."
+    respx.get(f"{BASE}/tickets").mock(return_value=httpx.Response(200, json={
+        "tickets": [{"id": "T001", "body": secret_body}, {"id": "T002", "body": "Hoe ruil ik een dienst?"}],
+        "next_cursor": None}))
+    respx.post(url__startswith=f"{BASE}/tickets/").mock(return_value=httpx.Response(200, json={}))
+
+    async def no_wait(_):
+        pass
+    async with HelpdeskClient(BASE, "key", "me@test", sleep=no_wait) as hd:
+        await run.post_all(hd, analyzer=SimpleNamespace(tokens_in=0, tokens_out=0), faq_ids=set(),
+                           workers=2, limit=None)
+
+    [log_file] = list((tmp_path / "logs").glob("run_*.jsonl"))
+    text = log_file.read_text(encoding="utf-8")
+    lines = [json.loads(line) for line in text.splitlines()]
+    assert sorted(line["ticket"] for line in lines) == ["T001", "T002"]  # exactly one line per ticket
+    assert all(line["outcome"] == "posted reply" and line["category"] == "question" for line in lines)
+    assert "4111" not in text and "kaart" not in text          # no ticket text, no card number
+    assert DECISION.draft_reply not in text                    # no draft either

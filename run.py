@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from helpdesk import AlreadyHandled, HelpdeskClient, HelpdeskError, UncertainOutcome
 from llm import Analysis, Analyzer, ClaudeClient, LLMError, Verdict
 from safety import Decision, empty_ticket_decision, gate, is_empty, redact_ticket, rule_hits
-from state import AlreadyRunning, StateFile, single_run
+from state import AlreadyRunning, StateFile, TicketLog, single_run
 
 log = logging.getLogger("run")
 
@@ -128,7 +128,7 @@ async def post_ticket(ticket: dict, hd: HelpdeskClient, analyzer: Analyzer, faq_
             log.error("%s: no decision, left open: %s", tid, e)
             return "failed: no decision (left open)"
         action, body = d.action, d.body()
-        await state.save(tid, status="posting", action=action, body=body)  # BEFORE the POST
+        await state.save(tid, status="posting", action=action, body=body, checks=d.failed_checks)  # BEFORE the POST
     return await send(hd, state, tid, action, body)
 
 
@@ -151,7 +151,7 @@ async def send(hd: HelpdeskClient, state: StateFile, tid: str, action: str, body
             raise
         if e.status in (400, 422):  # "Fix the body": decide again next run instead of resending this one
             log.error("%s: helpdesk rejected the decision: %s %s", tid, e, e.problems)
-            await state.save(tid, status="rejected", action=action, body=body, error=str(e))
+            await state.save(tid, **{**(state.get(tid) or {}), "status": "rejected", "error": str(e)})
             return f"failed: rejected ({e.status}), left open"
         if e.status == 404:  # "a ticket that is not in your current set"
             log.error("%s: not in the current ticket set (404)", tid)
@@ -159,7 +159,7 @@ async def send(hd: HelpdeskClient, state: StateFile, tid: str, action: str, body
         # 503/429 still failing after all retries: nothing was saved; the next run checks and resends
         log.error("%s: could not post, will check again next run: %s", tid, e)
         return "failed: could not post (left as posting)"
-    await state.save(tid, status="done", action=action, body=body, outcome=outcome)
+    await state.save(tid, **{**(state.get(tid) or {}), "status": "done", "outcome": outcome})
     return outcome
 
 
@@ -180,11 +180,13 @@ async def post_all(hd: HelpdeskClient, analyzer: Analyzer, faq_ids: set[str], wo
     """Post one decision per open ticket. A producer streams tickets into a small queue and `workers` tasks
     handle them in parallel, so only a few tickets are in memory however many are open."""
     state = StateFile()
+    ticket_log = TicketLog()
     queue: asyncio.Queue = asyncio.Queue(maxsize=workers * 2)
     outcomes: Counter = Counter()
 
     async def worker() -> None:
         while (ticket := await queue.get()) is not None:
+            started = time.monotonic()
             try:
                 outcome = await asyncio.wait_for(post_ticket(ticket, hd, analyzer, faq_ids, state), ticket_timeout)
             except TimeoutError:
@@ -200,10 +202,12 @@ async def post_all(hd: HelpdeskClient, analyzer: Analyzer, faq_ids: set[str], wo
                 log.exception("%s: unexpected error", ticket["id"])
                 outcome = f"failed: unexpected {type(e).__name__}"
             print(f"{ticket['id']}  {outcome}")
+            ticket_log.write(ticket["id"], outcome, state.get(ticket["id"]), time.monotonic() - started)
             outcomes[outcome] += 1
 
     await asyncio.gather(produce(hd, queue, workers, limit), *(worker() for _ in range(workers)))
-    print("\nSummary: " + (", ".join(f"{n} {o}" for o, n in sorted(outcomes.items())) or "no open tickets"))
+    print(f"\nLog: {ticket_log.path}")
+    print("Summary: " + (", ".join(f"{n} {o}" for o, n in sorted(outcomes.items())) or "no open tickets"))
     print(f"Tokens: {analyzer.tokens_in} in, {analyzer.tokens_out} out")
     if any(o.startswith("failed") for o in outcomes):
         sys.exit(1)  # some tickets are still open: run again
